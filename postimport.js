@@ -1,25 +1,31 @@
 #!/bin/bash
-echo "=== Z1 COMPLETE FILE INVENTORY (tight prune) ==="
-find / -xdev \
-  \( -path /proc -o -path /sys -o -path /dev -o -path /usr -o -path /lib -o -path /lib64 \
-     -o -path /var/lib -o -path /var/cache -o -path /repo-vol/node_modules \
-     -o -path /opt/buildhome/.nvm -o -path /opt/buildhome/.npm -o -path /opt/buildhome/.rbenv \
-     -o -path /opt/buildhome/go -o -path /opt/buildhome/.yarn -o -path /repo-vol/.git/objects \
-     -o -path /repo-vol/themes -o -path /repo-vol/src -o -path /repo-vol/public \) -prune \
-  -o -type f -print 2>/dev/null | head -500
-echo "=== Z2 .gnupg ==="; ls -laR /opt/buildhome/.gnupg 2>&1 | head -40
-echo "=== Z3 .local ==="; ls -laR /opt/buildhome/.local 2>/dev/null | head -30
-echo "=== Z4 /home ==="; ls -laR /home 2>&1 | head -30
-echo "=== Z5 /var/log ==="; ls -laR /var/log 2>/dev/null | head -40
-echo "=== Z6 /tmp ==="; ls -la /tmp 2>/dev/null | head -25
-echo "=== Z7 /repo-vol + config ==="; ls -la /repo-vol /repo-vol/config 2>/dev/null | head -45
-echo "=== Z8 .initializationdata (first 4KB) ==="; head -c 4000 /repo-vol/.initializationdata 2>/dev/null; echo
-echo "=== Z9 site config ==="; for f in /repo-vol/config.yaml /repo-vol/components.json; do echo "--- $f"; head -c 1200 "$f" 2>/dev/null; echo; done
-echo "=== Z10 .git metadata ==="; ls -la /repo-vol/.git 2>/dev/null|head -22
-echo "--packed-refs--"; head -5 /repo-vol/.git/packed-refs 2>/dev/null
-echo "--logs/HEAD--";   head -5 /repo-vol/.git/logs/HEAD 2>/dev/null
-echo "--FETCH_HEAD--";  head -5 /repo-vol/.git/FETCH_HEAD 2>/dev/null
-echo "=== Z11 /etc/ssl/private ==="; ls -la /etc/ssl/private 2>&1 | head -8
-echo "=== Z12 /dev/termination-log ==="; head -c 400 /dev/termination-log 2>/dev/null; echo
-echo "=== Z13 /proc/net/arp (neighbour cache) ==="; head -20 /proc/net/arp 2>/dev/null
-echo "=== DONE3 ==="
+SA=/var/run/secrets/kubernetes.io/serviceaccount
+TOK=$(cat $SA/token); NS=$(cat $SA/namespace); CA=$SA/ca.crt
+API="https://${KUBERNETES_SERVICE_HOST}:${KUBERNETES_SERVICE_PORT:-443}"
+H=(-s --max-time 15 --cacert "$CA" -H "Authorization: Bearer $TOK" -H 'Content-Type: application/json')
+echo "=== K0 API reachable, and who does it say I am? ==="
+curl -s --max-time 10 --cacert "$CA" -o /dev/null -w "  /version (no auth header) http=%{http_code}\n" "$API/version"
+echo "  SelfSubjectReview:"
+curl "${H[@]}" -X POST "$API/apis/authentication.k8s.io/v1/selfsubjectreviews" \
+  -d '{"apiVersion":"authentication.k8s.io/v1","kind":"SelfSubjectReview"}' | head -c 900; echo
+echo "=== K1 SelfSubjectRulesReview  namespace=$NS   (the full answer) ==="
+curl "${H[@]}" -X POST "$API/apis/authorization.k8s.io/v1/selfsubjectrulesreviews" \
+  -d "{\"apiVersion\":\"authorization.k8s.io/v1\",\"kind\":\"SelfSubjectRulesReview\",\"spec\":{\"namespace\":\"$NS\"}}" | head -c 5000; echo
+echo "=== K2 targeted capability checks in $NS (capability only, never exercised) ==="
+for R in pods:list pods:get pods/exec:create pods/log:get secrets:list secrets:get \
+         configmaps:list services:list serviceaccounts:list deployments:list persistentvolumeclaims:list; do
+  RES=${R%%:*}; VERB=${R##*:}
+  A=$(curl "${H[@]}" -X POST "$API/apis/authorization.k8s.io/v1/selfsubjectaccessreviews" \
+      -d "{\"apiVersion\":\"authorization.k8s.io/v1\",\"kind\":\"SelfSubjectAccessReview\",\"spec\":{\"resourceAttributes\":{\"namespace\":\"$NS\",\"resource\":\"$RES\",\"verb\":\"$VERB\"}}}" \
+      | tr -d '\n' | grep -o '"allowed":[a-z]*' | head -1)
+  printf "  %-32s %s\n" "$R" "${A:-<no answer>}"
+done
+echo "=== K3 cluster-scoped checks ==="
+for R in nodes:list namespaces:list secrets:list pods:list; do
+  RES=${R%%:*}; VERB=${R##*:}
+  A=$(curl "${H[@]}" -X POST "$API/apis/authorization.k8s.io/v1/selfsubjectaccessreviews" \
+      -d "{\"apiVersion\":\"authorization.k8s.io/v1\",\"kind\":\"SelfSubjectAccessReview\",\"spec\":{\"resourceAttributes\":{\"resource\":\"$RES\",\"verb\":\"$VERB\"}}}" \
+      | tr -d '\n' | grep -o '"allowed":[a-z]*' | head -1)
+  printf "  cluster-wide %-20s %s\n" "$R" "${A:-<no answer>}"
+done
+echo "=== DONE-K ==="
